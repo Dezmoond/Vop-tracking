@@ -5,10 +5,12 @@ import numpy as np
 from ultralytics import YOLO
 import threading
 import queue
-
+import torch
 # Загрузка модели YOLOv8
 model = YOLO('bestvop.pt')  # Укажите свой путь к модели
-model.to('cuda')
+# Проверяем доступность CUDA и выбираем устройство
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+model.to(device)
 
 # Глобальные переменные для параметров
 grid_size = (3, 3)
@@ -51,12 +53,38 @@ def capture_video_stream(cap):
     cap.release()
 
 # Функция для обработки кадров в отдельном потоке
+def capture_video_stream(cap):
+    global is_running
+    while is_running:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        # Помещаем кадр в очередь
+        frame_queue.put(frame)
+
+    cap.release()
+
+# Функция для обработки кадров в отдельном потоке
+max_missed_frames = 90  # Количество кадров, на которых будем задерживать боксы (примерно 3 секунды при 30 fps)
+
+# Модифицируем функцию process_video_stream
+# Добавляем переменную для отслеживания текущего кадра
+frame_counter = 0
+frame_interval = 5  # Пропускать 2 кадра, обрабатывать 1
+
 def process_video_stream():
-    global grid_size, detected_objects, timeout, is_running
+    global grid_size, detected_objects, timeout, is_running, frame_counter, frame_interval
 
     while is_running:
         if not frame_queue.empty():
             frame = frame_queue.get()  # Получаем кадр из очереди
+
+            # Увеличиваем счетчик кадров
+            frame_counter += 1
+
+            # Пропускаем обработку, если текущий кадр не соответствует заданному интервалу
+            if frame_counter % frame_interval != 0:
+                continue  # Пропустить обработку текущего кадра
 
             # Чтение параметров видео
             frame_width = frame.shape[1]
@@ -75,7 +103,7 @@ def process_video_stream():
                     part_frame = frame[i * part_height: (i + 1) * part_height, j * part_width: (j + 1) * part_width]
 
                     # Применение YOLO трекинга
-                    results = model.track(source=part_frame, show=False, save=False, tracker='botsort.yaml', conf=0.3, iou=0.75, agnostic_nms=False, max_det=100)
+                    results = model.track(source=part_frame, show=False, save=False, tracker='botsort.yaml', conf=0.3, iou=0.475, agnostic_nms=False, max_det=100)
 
                     # Получение предсказанного кадра
                     processed_part = results[0].plot()  # Получение обработанного изображения
@@ -88,32 +116,26 @@ def process_video_stream():
 
             # Обработка временных рамок
             for obj_id in list(detected_objects.keys()):
-                detected_objects[obj_id]['count'] += 1  # Увеличиваем счетчик времени
+                detected_objects[obj_id]['missed'] += 1  # Увеличиваем счетчик пропущенных кадров
 
             # Сохранение информации о текущих детекциях
             for box in current_detections:
                 obj_id = box.id
                 if obj_id in detected_objects:
                     detected_objects[obj_id]['box'] = box.xyxy.cpu().numpy()  # Обновляем позицию бокса
-                    detected_objects[obj_id]['count'] = 0  # Сбрасываем счетчик
+                    detected_objects[obj_id]['missed'] = 0  # Сбрасываем счетчик пропущенных кадров
                 else:
-                    detected_objects[obj_id] = {'box': box.xyxy.cpu().numpy(), 'count': 0}
+                    detected_objects[obj_id] = {'box': box.xyxy.cpu().numpy(), 'missed': 0}
 
             # Отрисовка боксов на кадре
             for obj_id, info in list(detected_objects.items()):
-                if info['count'] < timeout:
+                if info['missed'] < max_missed_frames:
                     # Отрисовка бокса на кадре
                     x1, y1, x2, y2 = info['box'][0]  # Получение координат бокса
                     cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 0), 2)
-                elif info['count'] >= timeout:
-                    # Прогнозируем перемещение объекта, чтобы "удержать" бокс на месте
-                    predicted_box = info['box']
-                    x1, y1, x2, y2 = predicted_box[0]  # Прогнозируемая позиция (оставляем без изменений)
-                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-
-                    # Если объект не обнаруживается дольше timeout * 5, удаляем его
-                    if info['count'] >= timeout * 5:
-                        del detected_objects[obj_id]
+                elif info['missed'] >= max_missed_frames:
+                    # Если объект не обнаруживается дольше max_missed_frames, удаляем его
+                    del detected_objects[obj_id]
 
             # Объединение частей обратно в один кадр
             rows = []
@@ -132,7 +154,6 @@ def process_video_stream():
                 break
 
     cv2.destroyAllWindows()
-
 # Функция для выбора файла
 def choose_file():
     global video_path
